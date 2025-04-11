@@ -1,0 +1,755 @@
+---
+title: "Spatial_transcriptomics_Stereo-seq"
+author: "Zhirui Jiang"
+date: "20250324"
+output: html_document
+---
+
+## Convert Stereo-seq data to Seurat format without losing image layer according to:
+https://github.com/limin321/addImg2annData?tab=readme-ov-file
+
+## Load library
+```{r}
+library(Seurat)
+library(SeuratData)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(harmony)
+library(DoubletFinder)
+```
+```{r}
+set.seed(1234)
+setwd("/Stereo-seq")
+```
+
+
+## Load Seurat format converted Stereo-seq data (hires = 1, lowers = 1, bin size = 20)
+```{r}
+control1 <- readRDS("seurat/F213.addimg.rds")
+table(control1@meta.data$orig.ident)
+control1@meta.data$orig.ident <- "control1"
+Idents(control1)<-"orig.ident"
+nrow(control1@meta.data)
+
+control2 <- readRDS("seurat/C214.addimg.rds")
+table(control2@meta.data$orig.ident)
+control2@meta.data$orig.ident <- "control2"
+Idents(control2)<-"orig.ident"
+nrow(control2@meta.data)
+
+mutant1 <- readRDS("seurat/G312.addimg.rds")
+table(mutant1@meta.data$orig.ident)
+mutant1@meta.data$orig.ident <- "mutant1"
+Idents(mutant1)<-"orig.ident"
+nrow(mutant1@meta.data)
+
+mutant2 <- readRDS("seurat/A213.addimg.rds")
+table(mutant2@meta.data$orig.ident)
+mutant2@meta.data$orig.ident <- "mutant2"
+Idents(mutant2)<-"orig.ident"
+nrow(mutant2@meta.data)
+```
+
+## Data Preprocessing
+```{r}
+plot1 <- VlnPlot(control1, features = "nCount_Spatial", pt.size = 0) + NoLegend()
+plot2 <- SpatialFeaturePlot(control1, features = "nCount_Spatial",pt.size.factor = 0.12, alpha = c(0.5,1)) + theme(legend.position = "right")
+wrap_plots(plot1, plot2)
+```
+
+# Filtering cells
+
+```{r}
+# Add number of genes per UMI for each cell to metadata
+control1$log10GenesPerUMI <- log10(control1$nFeature_Spatial) / log10(control1$nCount_Spatial)
+# Compute percent mito ratio
+DefaultAssay(control1)<-"Spatial"
+control1$mitoRatio <- PercentageFeatureSet(object = control1, pattern = "^mt-")
+control1$mitoRatio <- control1@meta.data$mitoRatio / 100
+# Create metadata dataframe
+metadata <- control1@meta.data
+# Add cell IDs to metadata
+metadata$cells <- rownames(metadata)
+# Rename columns
+metadata <- metadata %>%
+        dplyr::rename(nUMI = nCount_Spatial,
+                      nGene = nFeature_Spatial)
+# Add metadata back to Seurat object
+control1@meta.data <- metadata
+
+# Visualize the number of cell counts per sample
+metadata %>% 
+  	ggplot(aes(x=orig.ident, fill=orig.ident)) + 
+  	geom_bar() +
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells")
+
+# Visualize the number UMIs/transcripts per cell
+metadata %>% 
+  	ggplot(aes(color=orig.ident, x=nUMI, fill= orig.ident)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	ylab("Cell density") +
+  	geom_vline(xintercept = 200)
+
+# Visualize the distribution of genes detected per cell via histogram
+metadata %>% 
+  	ggplot(aes(color=orig.ident, x=nGene, fill= orig.ident)) + 
+  	geom_density(alpha = 0.2) + 
+  	theme_classic() +
+  	scale_x_log10() + 
+  	geom_vline(xintercept = 50)
+
+# Visualize the distribution of genes detected per cell via boxplot
+metadata %>% 
+  	ggplot(aes(x=orig.ident, y=log10(nGene), fill=orig.ident)) + 
+  	geom_boxplot() + 
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells vs NGenes")
+
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+metadata %>% 
+  	ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  	geom_point() + 
+	scale_colour_gradient(low = "gray90", high = "black") +
+  	stat_smooth(method=lm) +
+  	scale_x_log10() + 
+  	scale_y_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 200) +
+  	geom_hline(yintercept = 80) +
+  	facet_wrap(~orig.ident)
+
+# Visualize the distribution of mitochondrial gene expression detected per cell
+metadata %>% 
+  	ggplot(aes(color=orig.ident, x=mitoRatio, fill=orig.ident)) + 
+  	geom_density(alpha = 0.1) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 0.05)
+
+# Visualize the overall complexity of the gene expression by visualizing the genes detected per UMI
+metadata %>%
+  	ggplot(aes(x=log10GenesPerUMI, color = orig.ident, fill=orig.ident)) +
+  	geom_density(alpha = 0.2) +
+  	theme_classic() +
+  	geom_vline(xintercept = 0.65)
+
+# Filter out low quality reads using selected thresholds - these will change with experiment
+control1.filtered <- subset(x = control1, 
+                         subset= (nUMI >= 200) & 
+                           (nGene >= 50) & 
+                           (log10GenesPerUMI > 0.65) & 
+                           (mitoRatio <= 0.05))
+```
+
+
+```{r}
+# Add number of genes per UMI for each cell to metadata
+control2$log10GenesPerUMI <- log10(control2$nFeature_Spatial) / log10(control2$nCount_Spatial)
+# Compute percent mito ratio
+DefaultAssay(control2)<-"Spatial"
+control2$mitoRatio <- PercentageFeatureSet(object = control2, pattern = "^mt-")
+control2$mitoRatio <- control2@meta.data$mitoRatio / 100
+# Create metadata dataframe
+metadata <- control2@meta.data
+# Add cell IDs to metadata
+metadata$cells <- rownames(metadata)
+# Rename columns
+metadata <- metadata %>%
+        dplyr::rename(nUMI = nCount_Spatial,
+                      nGene = nFeature_Spatial)
+# Add metadata back to Seurat object
+control2@meta.data <- metadata
+
+# Visualize the number of cell counts per sample
+metadata %>% 
+  	ggplot(aes(x=orig.ident, fill=orig.ident)) + 
+  	geom_bar() +
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells")
+
+# Visualize the number UMIs/transcripts per cell
+metadata %>% 
+  	ggplot(aes(color=orig.ident, x=nUMI, fill= orig.ident)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	ylab("Cell density") +
+  	geom_vline(xintercept = 200)
+
+# Visualize the distribution of genes detected per cell via histogram
+metadata %>% 
+  	ggplot(aes(color=orig.ident, x=nGene, fill= orig.ident)) + 
+  	geom_density(alpha = 0.2) + 
+  	theme_classic() +
+  	scale_x_log10() + 
+  	geom_vline(xintercept = 50)
+
+# Visualize the distribution of genes detected per cell via boxplot
+metadata %>% 
+  	ggplot(aes(x=orig.ident, y=log10(nGene), fill=orig.ident)) + 
+  	geom_boxplot() + 
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells vs NGenes")
+
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+metadata %>% 
+  	ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  	geom_point() + 
+	scale_colour_gradient(low = "gray90", high = "black") +
+  	stat_smooth(method=lm) +
+  	scale_x_log10() + 
+  	scale_y_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 200) +
+  	geom_hline(yintercept = 80) +
+  	facet_wrap(~orig.ident)
+
+# Visualize the distribution of mitochondrial gene expression detected per cell
+metadata %>% 
+  	ggplot(aes(color=orig.ident, x=mitoRatio, fill=orig.ident)) + 
+  	geom_density(alpha = 0.1) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 0.05)
+
+# Visualize the overall complexity of the gene expression by visualizing the genes detected per UMI
+metadata %>%
+  	ggplot(aes(x=log10GenesPerUMI, color = orig.ident, fill=orig.ident)) +
+  	geom_density(alpha = 0.2) +
+  	theme_classic() +
+  	geom_vline(xintercept = 0.65)
+
+# Filter out low quality reads using selected thresholds - these will change with experiment
+control2.filtered <- subset(x = control2, 
+                         subset= (nUMI >= 200) & 
+                           (nGene >= 50) & 
+                           (log10GenesPerUMI > 0.65) & 
+                           (mitoRatio <= 0.05))
+```
+
+
+```{r}
+# Add number of genes per UMI for each cell to metadata
+mutant1$log10GenesPerUMI <- log10(mutant1$nFeature_Spatial) / log10(mutant1$nCount_Spatial)
+# Compute percent mito ratio
+DefaultAssay(mutant1)<-"Spatial"
+mutant1$mitoRatio <- PercentageFeatureSet(object = mutant1, pattern = "^mt-")
+mutant1$mitoRatio <- mutant1@meta.data$mitoRatio / 100
+# Create metadata dataframe
+metadata <- mutant1@meta.data
+# Add cell IDs to metadata
+metadata$cells <- rownames(metadata)
+# Rename columns
+metadata <- metadata %>%
+        dplyr::rename(nUMI = nCount_Spatial,
+                      nGene = nFeature_Spatial)
+# Add metadata back to Seurat object
+mutant1@meta.data <- metadata
+
+# Visualize the number of cell counts per sample
+metadata %>% 
+  	ggplot(aes(x=orig.ident, fill=orig.ident)) + 
+  	geom_bar() +
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells")
+
+# Visualize the number UMIs/transcripts per cell
+metadata %>% 
+  	ggplot(aes(color=orig.ident, x=nUMI, fill= orig.ident)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	ylab("Cell density") +
+  	geom_vline(xintercept = 200)
+
+# Visualize the distribution of genes detected per cell via histogram
+metadata %>% 
+  	ggplot(aes(color=orig.ident, x=nGene, fill= orig.ident)) + 
+  	geom_density(alpha = 0.2) + 
+  	theme_classic() +
+  	scale_x_log10() + 
+  	geom_vline(xintercept = 50)
+
+# Visualize the distribution of genes detected per cell via boxplot
+metadata %>% 
+  	ggplot(aes(x=orig.ident, y=log10(nGene), fill=orig.ident)) + 
+  	geom_boxplot() + 
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells vs NGenes")
+
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+metadata %>% 
+  	ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  	geom_point() + 
+	scale_colour_gradient(low = "gray90", high = "black") +
+  	stat_smooth(method=lm) +
+  	scale_x_log10() + 
+  	scale_y_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 200) +
+  	geom_hline(yintercept = 80) +
+  	facet_wrap(~orig.ident)
+
+# Visualize the distribution of mitochondrial gene expression detected per cell
+metadata %>% 
+  	ggplot(aes(color=orig.ident, x=mitoRatio, fill=orig.ident)) + 
+  	geom_density(alpha = 0.1) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 0.05)
+
+# Visualize the overall complexity of the gene expression by visualizing the genes detected per UMI
+metadata %>%
+  	ggplot(aes(x=log10GenesPerUMI, color = orig.ident, fill=orig.ident)) +
+  	geom_density(alpha = 0.2) +
+  	theme_classic() +
+  	geom_vline(xintercept = 0.65)
+
+# Filter out low quality reads using selected thresholds - these will change with experiment
+mutant1.filtered <- subset(x = mutant1, 
+                         subset= (nUMI >= 200) & 
+                           (nGene >= 100) & 
+                           (log10GenesPerUMI > 0.75) & 
+                           (mitoRatio <= 0.05))
+```
+
+
+```{r}
+# Add number of genes per UMI for each cell to metadata
+mutant2$log10GenesPerUMI <- log10(mutant2$nFeature_Spatial) / log10(mutant2$nCount_Spatial)
+# Compute percent mito ratio
+DefaultAssay(mutant2)<-"Spatial"
+mutant2$mitoRatio <- PercentageFeatureSet(object = mutant2, pattern = "^mt-")
+mutant2$mitoRatio <- mutant2@meta.data$mitoRatio / 100
+# Create metadata dataframe
+metadata <- mutant2@meta.data
+# Add cell IDs to metadata
+metadata$cells <- rownames(metadata)
+# Rename columns
+metadata <- metadata %>%
+        dplyr::rename(nUMI = nCount_Spatial,
+                      nGene = nFeature_Spatial)
+# Add metadata back to Seurat object
+mutant2@meta.data <- metadata
+
+# Visualize the number of cell counts per sample
+metadata %>% 
+  	ggplot(aes(x=orig.ident, fill=orig.ident)) + 
+  	geom_bar() +
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells")
+
+# Visualize the number UMIs/transcripts per cell
+metadata %>% 
+  	ggplot(aes(color=orig.ident, x=nUMI, fill= orig.ident)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	ylab("Cell density") +
+  	geom_vline(xintercept = 200)
+
+# Visualize the distribution of genes detected per cell via histogram
+metadata %>% 
+  	ggplot(aes(color=orig.ident, x=nGene, fill= orig.ident)) + 
+  	geom_density(alpha = 0.2) + 
+  	theme_classic() +
+  	scale_x_log10() + 
+  	geom_vline(xintercept = 50)
+
+# Visualize the distribution of genes detected per cell via boxplot
+metadata %>% 
+  	ggplot(aes(x=orig.ident, y=log10(nGene), fill=orig.ident)) + 
+  	geom_boxplot() + 
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells vs NGenes")
+
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+metadata %>% 
+  	ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  	geom_point() + 
+	scale_colour_gradient(low = "gray90", high = "black") +
+  	stat_smooth(method=lm) +
+  	scale_x_log10() + 
+  	scale_y_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 200) +
+  	geom_hline(yintercept = 80) +
+  	facet_wrap(~orig.ident)
+
+# Visualize the distribution of mitochondrial gene expression detected per cell
+metadata %>% 
+  	ggplot(aes(color=orig.ident, x=mitoRatio, fill=orig.ident)) + 
+  	geom_density(alpha = 0.1) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 0.05)
+
+# Visualize the overall complexity of the gene expression by visualizing the genes detected per UMI
+metadata %>%
+  	ggplot(aes(x=log10GenesPerUMI, color = orig.ident, fill=orig.ident)) +
+  	geom_density(alpha = 0.2) +
+  	theme_classic() +
+  	geom_vline(xintercept = 0.65)
+
+# Filter out low quality reads using selected thresholds - these will change with experiment
+mutant2.filtered <- subset(x = mutant2, 
+                         subset= (nUMI >= 200) & 
+                           (nGene >= 100) & 
+                           (log10GenesPerUMI > 0.75) & 
+                           (mitoRatio <= 0.05))
+```
+
+# Find and remove doublets
+```{r}
+# Need to be performed before merging the data
+## pK Identification (no ground-truth) ---------------------------------------------------------------------------------------
+control1.filtered <- SCTransform(control1.filtered, assay = "Spatial", verbose = TRUE, vars.to.regress = "mitoRatio")
+control1.normalized  <- RunPCA(control1.filtered, assay = "SCT", verbose = FALSE)
+control1.normalized  <- FindNeighbors(control1.normalized, reduction = "pca", dims = 1:10)
+control1.normalized <- FindClusters(control1.normalized,resolution = 0.4, verbose = FALSE)
+control1.normalized  <- RunUMAP(control1.normalized, reduction = "pca", dims = 1:30)
+DefaultAssay(control1.normalized) <- "Spatial"
+control1.normalized@assays$RNA <- control1.normalized@assays$SCT # assiging SCT as RNA to use DoubletFinder
+sweep.res.list_control1.normalized <- paramSweep(control1.normalized, PCs = 1:10, sct = TRUE)
+sweep.stats_control1.normalized <- summarizeSweep(sweep.res.list_control1.normalized, GT = FALSE)
+bcmvn_control1.normalized <- find.pK(sweep.stats_control1.normalized)
+
+## determine the optimal pK value by plotting:
+pK_value <- bcmvn_control1.normalized$pK[which.max(bcmvn_control1.normalized$BCmetric)] # find the peak of the curve
+optimal_pK <- bcmvn_control1.normalized$pK[which.max(bcmvn_control1.normalized$BCmetric)]
+print(optimal_pK)
+
+## estimate Homotypic Doublet Proportion
+homotypic.prop <- modelHomotypic(control1.normalized@meta.data$seurat_clusters)
+nExp_poi <- round(0.05 * ncol(control1.normalized))  # Assuming ~5% doublets
+nExp_poi.adj <- round(nExp_poi * (1 - homotypic.prop))
+
+## Run DoubleFinder
+control1.normalized <- doubletFinder(
+  control1.normalized,
+  PCs = 1:10,
+  pN = 0.25,  # Default for 10X data, may adjust
+  pK = 0.16, 
+  nExp = nExp_poi.adj,
+  reuse.pANN = NULL,
+  sct = TRUE
+)
+
+## Visualize Doublets
+DimPlot(control1.normalized, group.by = "DF.classifications_0.25_0.16_585")
+
+## Remove Doublets
+control1.singlet <- subset(control1.normalized, subset = DF.classifications_0.25_0.16_585 == "Singlet")
+DimPlot(control1.singlet)
+saveRDS(control1.singlet, 'control1.filtered_lasso_bin20_singlet.rds')
+```
+
+```{r}
+# Need to be performed before merging the data
+## pK Identification (no ground-truth) ---------------------------------------------------------------------------------------
+control2.filtered <- SCTransform(control2.filtered, assay = "Spatial", verbose = TRUE, vars.to.regress = "mitoRatio")
+control2.normalized  <- RunPCA(control2.filtered, assay = "SCT", verbose = FALSE)
+control2.normalized  <- FindNeighbors(control2.normalized, reduction = "pca", dims = 1:10)
+control2.normalized <- FindClusters(control2.normalized,resolution = 0.4, verbose = FALSE)
+control2.normalized  <- RunUMAP(control2.normalized, reduction = "pca", dims = 1:30)
+DefaultAssay(control2.normalized) <- "Spatial"
+control2.normalized@assays$RNA <- control2.normalized@assays$SCT # assiging SCT as RNA to use DoubletFinder
+sweep.res.list_control2.normalized <- paramSweep(control2.normalized, PCs = 1:10, sct = TRUE)
+sweep.stats_control2.normalized <- summarizeSweep(sweep.res.list_control2.normalized, GT = FALSE)
+bcmvn_control2.normalized <- find.pK(sweep.stats_control2.normalized)
+
+## determine the optimal pK value by plotting:
+pK_value <- bcmvn_control2.normalized$pK[which.max(bcmvn_control2.normalized$BCmetric)] # find the peak of the curve
+optimal_pK <- bcmvn_control2.normalized$pK[which.max(bcmvn_control2.normalized$BCmetric)]
+print(optimal_pK)
+
+## estimate Homotypic Doublet Proportion
+homotypic.prop <- modelHomotypic(control2.normalized@meta.data$seurat_clusters)
+nExp_poi <- round(0.05 * ncol(control2.normalized))  # Assuming ~5% doublets
+nExp_poi.adj <- round(nExp_poi * (1 - homotypic.prop))
+
+## Run DoubleFinder
+control2.normalized <- doubletFinder(
+  control2.normalized,
+  PCs = 1:10,
+  pN = 0.25,  # Default for 10X data, may adjust
+  pK = 0.16, 
+  nExp = nExp_poi.adj,
+  reuse.pANN = NULL,
+  sct = TRUE
+)
+
+## Visualize Doublets
+DimPlot(control2.normalized, group.by = "DF.classifications_0.25_0.16_585")
+
+## Remove Doublets
+control2.singlet <- subset(control2.normalized, subset = DF.classifications_0.25_0.16_585 == "Singlet")
+DimPlot(control2.singlet)
+saveRDS(control2.singlet, 'control2.filtered_lasso_bin20_singlet.rds')
+```
+
+
+```{r}
+# Need to be performed before merging the data
+## pK Identification (no ground-truth) ---------------------------------------------------------------------------------------
+mutant1.filtered <- SCTransform(mutant1.filtered, assay = "Spatial", verbose = TRUE, vars.to.regress = "mitoRatio")
+mutant1.normalized  <- RunPCA(mutant1.filtered, assay = "SCT", verbose = FALSE)
+mutant1.normalized  <- FindNeighbors(mutant1.normalized, reduction = "pca", dims = 1:10)
+mutant1.normalized <- FindClusters(mutant1.normalized,resolution = 0.4, verbose = FALSE)
+mutant1.normalized  <- RunUMAP(mutant1.normalized, reduction = "pca", dims = 1:30)
+DefaultAssay(mutant1.normalized) <- "Spatial"
+mutant1.normalized@assays$RNA <- mutant1.normalized@assays$SCT # assiging SCT as RNA to use DoubletFinder
+sweep.res.list_mutant1.normalized <- paramSweep(mutant1.normalized, PCs = 1:10, sct = TRUE)
+sweep.stats_mutant1.normalized <- summarizeSweep(sweep.res.list_mutant1.normalized, GT = FALSE)
+bcmvn_mutant1.normalized <- find.pK(sweep.stats_mutant1.normalized)
+
+## determine the optimal pK value by plotting:
+pK_value <- bcmvn_mutant1.normalized$pK[which.max(bcmvn_mutant1.normalized$BCmetric)] # find the peak of the curve
+optimal_pK <- bcmvn_mutant1.normalized$pK[which.max(bcmvn_mutant1.normalized$BCmetric)]
+print(optimal_pK)
+
+## estimate Homotypic Doublet Proportion
+homotypic.prop <- modelHomotypic(mutant1.normalized@meta.data$seurat_clusters)
+nExp_poi <- round(0.05 * ncol(mutant1.normalized))  # Assuming ~5% doublets
+nExp_poi.adj <- round(nExp_poi * (1 - homotypic.prop))
+
+## Run DoubleFinder
+mutant1.normalized <- doubletFinder(
+  mutant1.normalized,
+  PCs = 1:10,
+  pN = 0.25,  # Default for 10X data, may adjust
+  pK = 0.13, 
+  nExp = nExp_poi.adj,
+  reuse.pANN = NULL,
+  sct = TRUE
+)
+
+## Visualize Doublets
+DimPlot(mutant1.normalized, group.by = "DF.classifications_0.25_0.13_480")
+
+## Remove Doublets
+mutant1.singlet <- subset(mutant1.normalized, subset = DF.classifications_0.25_0.13_480 == "Singlet")
+DimPlot(mutant1.singlet)
+saveRDS(mutant1.singlet, 'mutant1.filtered_lasso_bin20_singlet.rds')
+```
+
+```{r}
+# Need to be performed before merging the data
+## pK Identification (no ground-truth) ---------------------------------------------------------------------------------------
+mutan2.filtered <- SCTransform(mutan2.filtered, assay = "Spatial", verbose = TRUE, vars.to.regress = "mitoRatio")
+mutan2.normalized  <- RunPCA(mutan2.filtered, assay = "SCT", verbose = FALSE)
+mutan2.normalized  <- FindNeighbors(mutan2.normalized, reduction = "pca", dims = 1:10)
+mutan2.normalized <- FindClusters(mutan2.normalized,resolution = 0.4, verbose = FALSE)
+mutan2.normalized  <- RunUMAP(mutan2.normalized, reduction = "pca", dims = 1:30)
+DefaultAssay(mutan2.normalized) <- "Spatial"
+mutan2.normalized@assays$RNA <- mutan2.normalized@assays$SCT # assiging SCT as RNA to use DoubletFinder
+sweep.res.list_mutan2.normalized <- paramSweep(mutan2.normalized, PCs = 1:10, sct = TRUE)
+sweep.stats_mutan2.normalized <- summarizeSweep(sweep.res.list_mutan2.normalized, GT = FALSE)
+bcmvn_mutan2.normalized <- find.pK(sweep.stats_mutan2.normalized)
+
+## determine the optimal pK value by plotting:
+pK_value <- bcmvn_mutan2.normalized$pK[which.max(bcmvn_mutan2.normalized$BCmetric)] # find the peak of the curve
+optimal_pK <- bcmvn_mutan2.normalized$pK[which.max(bcmvn_mutan2.normalized$BCmetric)]
+print(optimal_pK)
+
+## estimate Homotypic Doublet Proportion
+homotypic.prop <- modelHomotypic(mutan2.normalized@meta.data$seurat_clusters)
+nExp_poi <- round(0.05 * ncol(mutan2.normalized))  # Assuming ~5% doublets
+nExp_poi.adj <- round(nExp_poi * (1 - homotypic.prop))
+
+## Run DoubleFinder
+mutan2.normalized <- doubletFinder(
+  mutan2.normalized,
+  PCs = 1:10,
+  pN = 0.25,  # Default for 10X data, may adjust
+  pK = 0.13, 
+  nExp = nExp_poi.adj,
+  reuse.pANN = NULL,
+  sct = TRUE
+)
+
+## Visualize Doublets
+DimPlot(mutan2.normalized, group.by = "DF.classifications_0.25_0.13_480")
+
+## Remove Doublets
+mutan2.singlet <- subset(mutan2.normalized, subset = DF.classifications_0.25_0.13_480 == "Singlet")
+DimPlot(mutan2.singlet)
+saveRDS(mutan2.singlet, 'mutan2.filtered_lasso_bin20_singlet.rds')
+```
+
+## Combine samples
+```{r}
+control1.singlet <- RenameCells(control1.singlet, new.names = paste0("ctrl1_", colnames(control1.singlet)))
+control2.singlet <- RenameCells(control2.singlet, new.names = paste0("ctrl2_", colnames(control2.singlet)))
+mutant1.singlet <- RenameCells(mutant1.singlet, new.names = paste0("mutant1_", colnames(mutant1.singlet)))
+mutant2.singlet <- RenameCells(mutant2.singlet, new.names = paste0("mutant2_", colnames(mutant2.singlet)))
+
+options(warn = 1)  # Warnings will no longer be treated as errors
+
+filtered <- merge(x = control1.singlet, y = c("control2.singlet","mutant1.singlet","mutant2.singlet"), project = "Stereoseq_spatial_merged")
+Idents(st.filtered) <- "orig.ident"
+head(st.filtered)
+unique(st.filtered$orig.ident)
+saveRDS(st.filtered, file = "filterd_merged_bin20.rds")
+```
+
+#Visualize QC Metrics as a violin plot
+```{r}
+p1<- VlnPlot(object = st.filtered, features = c("nUMI", "nGene","mitoRatio"), ncol=2, pt.size = 0)
+p2<- FeatureScatter(object = st.filtered, feature1 = "nUMI", feature2 = "nGene")
+p1+p2
+```
+
+## Normalization, dimensionality reduction
+```{r}
+#st.filtered <- readRDS('filtered_bin20.rds')
+st.filtered <- SCTransform(st.filtered, assay = "Spatial", verbose = TRUE, vars.to.regress = "mitoRatio")
+st.filtered  <- RunPCA(st.filtered , assay = "SCT", verbose = FALSE)
+st.filtered  <- RunUMAP(st.filtered, reduction = "pca", dims = 1:30)
+DimPlot(st.filtered, split.by = "orig.ident")
+saveRDS(st.filtered, 'PCA_bin20.rds')
+```
+
+## Batch correction with Harmony
+```{r}
+st.harmony <- RunHarmony(st.filtered, assay="SCT", group.by.vars = c("orig.ident"))
+st.harmony  <- RunUMAP(st.harmony, reduction = "harmony", dims = 1:30)
+DimPlot(st.harmony , split.by = "orig.ident")
+saveRDS(st.harmony , 'st.combined_lasso_b4culster_harmony_bin20_5vs11.rds')
+```
+
+## Clustering 
+```{r}
+#st.harmony_b4cluster <- readRDS('st.combined_lasso_b4culster_harmony_bin20_5vs11.rds')
+st.harmony_b4cluster  <- FindNeighbors(st.harmony_b4cluster, reduction = "harmony", dims = 1:10)
+st.combined <- FindClusters(st.harmony_b4cluster,resolution = 0.4, verbose = FALSE)
+st.combined  <- RunUMAP(st.combined, reduction = "harmony", dims = 1:50, min.dist = 0.5, spread = 0.5)
+DimPlot(st.combined, label = TRUE, raster=FALSE, group.by = "seurat_clusters", split.by = "orig.ident")
+saveRDS(st.combined, 'harmony_clustering_bin20.rds')
+```
+
+```{r}
+SpatialDimPlot(st.combined, label = TRUE, crop = TRUE, label.size = 3,pt.size.factor = 0.14, alpha = c(0.6,1), images = "slice1.2")
+```
+
+```{r}
+SpatialDimPlot(st.combined, cells.highlight = CellsByIdentities(object = st.combined, idents = c(4,6)), facet.highlight = TRUE, images = "slice1.2", pt.size.factor = 0.14,alpha = c(0.6,1), ncol = 2)
+```
+
+# Identification of Spatially Variable Features
+```{r}
+markers <- FindAllMarkers(st.combined, assay = "Spatial", only.pos = FALSE)
+```
+
+# Heatmap of top10 genes
+```{r}
+markers %>%
+  group_by(cluster) %>%
+  dplyr::filter(avg_log2FC > 0.25 & p_val < 0.05) %>%
+  slice_head(n = 10) %>%
+  ungroup() -> top10
+st.combined <- ScaleData(st.combined, assay = "Spatial", features = top10$gene)
+
+p <- DoHeatmap(st.combined, assay = "Spatial", features = top10$gene, size = 2.5) + theme(axis.text = element_text(size = 5.5)) + NoLegend()
+ggplot2::ggsave(filename = "heatmap_res0.4_bin20_top10.png", plot = p,height = 10)
+```
+
+
+# Adding gene annotation
+```{r}
+mouse_annotations <- read.csv("/mouse_annotations.csv")
+```
+
+# Merge gene annotations to marker results
+```{r}
+all_markers <- left_join(markers, 
+                         mouse_annotations[, c(1:2,4,5)], 
+                         by = c("gene" = "gene_name"))
+
+```
+
+# Write results to file
+```{r}
+write.csv(all_markers, "markers_spatial_cluster_bin20_res0.4.csv", quote = F)
+```
+
+# Gene expression visualization
+```{r}
+DefaultAssay(st.combined) <- "Spatial"
+SpatialFeaturePlot(st.combined, features = c("Sox9"),pt.size.factor = 0.2, alpha = c(0.5,1))
+SpatialFeaturePlot(st.combined, features = c("Col2a1"),pt.size.factor = 0.2, alpha = c(0.5,1))
+SpatialFeaturePlot(st.combined, features = c("Sdc3"),pt.size.factor = 0.2, alpha = c(0.5,1))
+SpatialFeaturePlot(st.combined, features = c("Anxa6"),pt.size.factor = 0.2, alpha = c(0.5,1))
+SpatialFeaturePlot(st.combined, features = c("Matn4"),pt.size.factor = 0.2, alpha = c(0.5,1))
+SpatialFeaturePlot(st.combined, features = c("Acan"),pt.size.factor = 0.2, alpha = c(0.5,1))
+SpatialFeaturePlot(st.combined, features = c("Ibsp"),pt.size.factor = 0.2, alpha = c(0.5,1))
+SpatialFeaturePlot(st.combined, features = c("Col1a1"),pt.size.factor = 0.2, alpha = c(0.5,1))
+SpatialFeaturePlot(st.combined, features = c("Runx2"),pt.size.factor = 0.2, alpha = c(0.5,1))
+```
+
+# Dot plot 
+```{r}
+# Adapte to your own marker gene list for mannual annotation
+markers.to.plot <- c("Cd44","Jarid2","Gphn",
+                     "Cryaa","Cryge","Crybb1",
+                     "Col2a1","Anxa6","Matn4",
+                     "Fabp7","Cldn11","Gja1",
+                     "Col1a1","Sparc","Col1a2",
+                     "Tubb3","Map1b","Reln",
+                     "Runx2","Alpl","Ibsp",
+                     "Ttn","Myh3","Acta1")
+DotPlot(st.combined, features = rev(markers.to.plot), cols = c("blue", "red"), dot.scale = 8) + RotatedAxis()
+```
+
+# Add condition to metadata
+```{r}
+# Modify metadata column
+st.combined$orig.ident[st.combined$orig.ident == "control1"] <- "control"
+st.combined$orig.ident[st.combined$orig.ident == "control2"] <- "control"
+st.combined$orig.ident[st.combined$orig.ident == "mutant2"] <- "mutant"
+st.combined$orig.ident[st.combined$orig.ident == "mutant2"] <- "mutant"
+
+# Add celltype and condition to seurat object
+st.combined$celltype <- Idents(st.combined)
+st.combined$celltype.stim <- paste(Idents(st.combined), st.combined$orig.ident, sep = "_")
+Idents(st.combined) <- "celltype.stim"
+```
+
+# DEGs between control and mutant
+```{r}
+# Get DEGs between control and mutant
+DEGs <- FindMarkers(st.combined, ident.1 = "1_mutant", ident.2 = "1_control", verbose = FALSE)
+head(DEGs, n = 15) # repeat this for each cluster by replacing the number
+write.csv(DEGs, "markers_spatial_cluster_bin20_res0.4_1_ctrl_vs_mut_DEGs.csv", quote = F)
+
+```
+
+# Label object after cell type annotation
+
+```{r}
+st.combined <- RenameIdents(st.combined, `0` = "Unknown Mesenchyme", `1` = "Osteoprogenitors", `2` = "Chondrogenic cells/connective tissue", `3` = "Neuronal cells", `4` = "Chondrogenic cells/connective tissue", `5` = "Osteoprogenitors", `6` = "Skeletal muscle cells")
+Idents(st.combined)
+DimPlot(st.combined, label = TRUE)
+SpatialDimPlot(st.combined, label = FALSE, crop = TRUE, label.size = 3,pt.size.factor = 0.14, alpha = c(0.6,1), images = "slice1.2")
+saveRDS(st.combined, 'annotated.rds')
+```
